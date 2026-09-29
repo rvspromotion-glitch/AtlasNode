@@ -19,4 +19,5 @@ Node: **Seedream 4.X Edit Sequential (Atlas)** under `ACG/Seedream`
 ## Tips
 - Mention the count in your prompt too ("generate 4 images of...")
 - `seed` is not sent to the API, it only forces a re-run
-- Use `model_override` if a version ID 404s
+- Starts on 4.7 by default; if that errors it retries once with `fallback_version` (4.5 by default, set to `none` to disable)
+- Use `model_override` if a version ID 404s (fallback is skipped when an override is set)

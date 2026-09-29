@@ -131,6 +131,8 @@ class SeedreamEditSequentialAtlas:
                 "poll_interval": ("FLOAT", {"default": 3.0, "min": 0.5, "max": 30.0, "step": 0.5}),
                 "timeout_sec": ("INT", {"default": 600, "min": 30, "max": 3600}),
                 "model_override": ("STRING", {"default": ""}),
+                # retried once with this version if the main one errors
+                "fallback_version": (["none"] + VERSIONS, {"default": "4.5"}),
                 # not sent to the API, only here so you can force a re-run
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
             },
@@ -157,6 +159,7 @@ class SeedreamEditSequentialAtlas:
         poll_interval=3.0,
         timeout_sec=600,
         model_override="",
+        fallback_version="4.5",
         seed=0,
     ):
         key = (api_key or "").strip() or os.environ.get("ATLASCLOUD_API_KEY", "")
@@ -165,14 +168,16 @@ class SeedreamEditSequentialAtlas:
         if not prompt.strip():
             raise ValueError("Prompt is empty.")
 
-        model = model_override.strip() or f"bytedance/seedream-v{model_version}/edit-sequential"
+        override = model_override.strip()
+        models = [override or f"bytedance/seedream-v{model_version}/edit-sequential"]
+        if not override and fallback_version not in ("none", model_version):
+            models.append(f"bytedance/seedream-v{fallback_version}/edit-sequential")
 
         if image.shape[0] > 1:
             print(f"[Seedream] Got a batch of {image.shape[0]}, using only the first as reference.")
         ref_uri = _tensor_to_data_uri(image[0], ref_format)
 
         payload = {
-            "model": model,
             "prompt": prompt,
             "images": [ref_uri],
             "size": _resolve_size(size, custom_width, custom_height),
@@ -186,6 +191,34 @@ class SeedreamEditSequentialAtlas:
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         })
+
+        for i, model in enumerate(models):
+            try:
+                outputs = self._run(session, dict(payload, model=model), poll_interval, timeout_sec)
+                break
+            except (RuntimeError, requests.RequestException) as e:
+                if i == len(models) - 1:
+                    raise
+                print(f"[Seedream] {model} failed ({e}), falling back to {models[i + 1]}")
+
+        # download + convert
+        pils = [_load_output(o, session) for o in outputs]
+        tw, th = pils[0].size
+        tensors = []
+        for p in pils:
+            if p.size != (tw, th):
+                print(f"[Seedream] Resizing {p.size} -> {(tw, th)} to fit batch")
+                p = p.convert("RGB").resize((tw, th), Image.LANCZOS)
+            tensors.append(_pil_to_tensor(p))
+
+        batch = torch.stack(tensors, dim=0)  # [N, H, W, 3]
+        url_str = "\n".join(o for o in outputs if o.startswith("http"))
+        return (batch, url_str, len(tensors))
+
+    def _run(self, session, payload, poll_interval, timeout_sec):
+        """Submit one prediction and poll until it finishes. Returns the outputs list."""
+        model = payload["model"]
+        num_images = payload["num_images"]
 
         # submit
         print(f"[Seedream] Submitting {model} | {payload['size']} | x{payload['num_images']}")
@@ -233,20 +266,7 @@ class SeedreamEditSequentialAtlas:
             raise RuntimeError("Prediction completed but returned no images (moderation?).")
 
         print(f"[Seedream] Done in {time.time() - start:.1f}s, got {len(outputs)}/{num_images} images")
-
-        # download + convert
-        pils = [_load_output(o, session) for o in outputs]
-        tw, th = pils[0].size
-        tensors = []
-        for p in pils:
-            if p.size != (tw, th):
-                print(f"[Seedream] Resizing {p.size} -> {(tw, th)} to fit batch")
-                p = p.convert("RGB").resize((tw, th), Image.LANCZOS)
-            tensors.append(_pil_to_tensor(p))
-
-        batch = torch.stack(tensors, dim=0)  # [N, H, W, 3]
-        url_str = "\n".join(o for o in outputs if o.startswith("http"))
-        return (batch, url_str, len(tensors))
+        return outputs
 
 
 NODE_CLASS_MAPPINGS = {
